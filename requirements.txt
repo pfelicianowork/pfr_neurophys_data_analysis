@@ -1,0 +1,8 @@
+numpy
+scipy
+matplotlib
+pandas
+h5py
+nwb
+open-ephys-python-tools
+nmmlearn
