@@ -36,10 +36,10 @@ from .pipeline import (
     build_spike_times_by_region,
 )
 from .mua import compute_region_mua_from_spikes
-# from swr_hmm_detection import (
-#     SWRHMMDetector,
-#     SWRHMMParams,   
-# )
+from .swr_hmm_detection import (
+    SWRHMMDetector,
+    SWRHMMParams,   
+)
 
 __version__ = "1.0.0"
 __all__ = [
@@ -59,4 +59,6 @@ __all__ = [
     'quick_overlay_plot',
     'build_spike_times_by_region',
     'compute_region_mua_from_spikes',
+    'SWRHMMDetector',
+    'SWRHMMParams',
 ]

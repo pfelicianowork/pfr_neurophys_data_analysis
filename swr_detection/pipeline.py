@@ -1,12 +1,12 @@
 from __future__ import annotations
-
+# --- Ripple bandpass filter utility ---
 import re
 from typing import Dict, List, Optional, Tuple, Union
 from math import ceil
 import copy
 import numpy as np
 import pandas as pd
-
+from scipy.signal import butter, filtfilt
 from . import SWRDetector, SWRParams, PRESETS
 import matplotlib.pyplot as plt
 try:
@@ -33,6 +33,13 @@ __all__ = [
     "plot_events_by_region_basic",
 ]
 
+def bandpass_ripple_lfp(lfp_array, fs, ripple_band=(150, 250)):
+    """
+    Bandpass filter LFP array in the ripple band (default: 150-250 Hz).
+    Returns the filtered trace.
+    """
+    b, a = butter(4, [ripple_band[0]/(fs/2), ripple_band[1]/(fs/2)], btype='band')
+    return filtfilt(b, a, lfp_array)
 
 def _get_unit_spike_times(sa, unit_id) -> np.ndarray:
     """Return spike times from common SpikeAnalysis-style containers."""

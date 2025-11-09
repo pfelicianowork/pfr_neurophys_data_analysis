@@ -49,7 +49,7 @@ def plot_velocity_comparison(time: np.ndarray, velocity: np.ndarray,
 
 
 
-def plot_interpolation_alignment(tvel, linVel, t_lfp, velocity, show=True, return_corr=True):
+def plot_interpolation_corr(tvel, linVel, t_lfp, velocity, show=True, return_corr=True):
     """
     Plot and compare original and interpolated velocity traces on both position and LFP timelines.
     Returns (corr_pos, corr_lfp).
@@ -111,3 +111,29 @@ def plot_interpolation_alignment(tvel, linVel, t_lfp, velocity, show=True, retur
 
     if return_corr:
         return corr_pos, corr_lfp
+
+
+def plot_interpolation_alignment(t_original, vel_original, t_interp, vel_interp, show=True):
+    """
+    Plot original and interpolated velocity traces for visual inspection.
+    Returns Pearson correlation coefficients for both traces.
+    """
+    # Compute correlation coefficients
+    from scipy.stats import pearsonr
+    # Interpolate original velocity to interpolated timeline for fair comparison
+    vel_original_on_interp = np.interp(t_interp, t_original, vel_original)
+    corr_pos = pearsonr(vel_original, np.interp(t_original, t_interp, vel_interp))[0]
+    corr_lfp = pearsonr(vel_original_on_interp, vel_interp)[0]
+
+    if show:
+        plt.figure(figsize=(10, 4))
+        plt.plot(t_original, vel_original, label='Original velocity', alpha=0.7)
+        plt.plot(t_interp, vel_interp, label='Interpolated velocity', alpha=0.7)
+        plt.xlabel('Time (s)')
+        plt.ylabel('Velocity')
+        plt.title('Original vs Interpolated Velocity')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    return corr_pos, corr_lfp

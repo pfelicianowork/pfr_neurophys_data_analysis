@@ -1,0 +1,75 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Data, models, and outputs
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.mat
+*.csv
+*.tsv
+*.dat
+*.pth
+*.pt
+*.pkl
+*.joblib
+*.sav
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.sqlite3
+*.db
+*.lfs
+
+# Large binary files
+*.mp4
+*.avi
+*.mov
+*.wav
+*.mp3
+*.flac
+*.zip
+*.tar.gz
+*.tar
+*.rar
+*.7z
+
+# Environment and IDE files
+.env
+.venv/
+venv/
+ENV/
+.envrc
+.vscode/
+.idea/
+*.egg-info/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# MATLAB files
+*.mex*
+*.fig
+*.mdl
+*.slx
+*.asv
+*.m~
+
+# Ignore test outputs
+*.coverage
+htmlcov/
+
+# Ignore notebooks outputs (optional)
+# *.ipynb
