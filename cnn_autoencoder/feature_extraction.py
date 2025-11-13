@@ -4,15 +4,40 @@ Extracts biological, spectral, temporal, and spatial features from detected even
 """
 
 import numpy as np
-import scipy.stats
-from scipy.signal import hilbert, butter, filtfilt, welch
+# scipy.stats was removed (unused import)
+from scipy.signal import hilbert, butter, filtfilt
 from scipy.stats import kurtosis, skew
 import warnings
 
 warnings.filterwarnings('ignore')
 
 
-def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp= None):
+# --- Helpers: LFP normalization and utility conversions ---
+def zscore_lfp(lfp_array):
+    """Z-score normalize LFP per-channel (or single-channel).
+
+    Returns a copy of the array normalized along channels when applicable.
+    """
+    if lfp_array is None:
+        return lfp_array
+    lfp = np.array(lfp_array, copy=True)
+    # 1D: single channel
+    if lfp.ndim == 1:
+        mean = np.nanmean(lfp)
+        std = np.nanstd(lfp) + 1e-10
+        return (lfp - mean) / std
+    # 2D: channels x time
+    mean = np.nanmean(lfp, axis=1, keepdims=True)
+    std = np.nanstd(lfp, axis=1, keepdims=True) + 1e-10
+    return (lfp - mean) / std
+
+
+def ms_to_samples(ms, fs):
+    """Convert milliseconds to samples given sampling frequency fs (Hz)."""
+    return int(np.round(ms / 1000.0 * fs))
+
+
+def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp=None, pre_ms=100, post_ms=100):
     """
     Extract comprehensive SWR features beyond spectrograms.
     
@@ -36,11 +61,11 @@ def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp= None):
     """
     
     features = {}
-    
+
     # --- 1. Temporal Features ---
-    features['duration'] = event['duration']
-    features['start_time'] = event['start_time']
-    features['end_time'] = event['end_time']
+    features['duration'] = event.get('duration', 0.0)
+    features['start_time'] = event.get('start_time', 0.0)
+    features['end_time'] = event.get('end_time', features['start_time'] + features['duration'])
     
     # Peak timing (normalized within event)
     if 'peak_time' in event:
@@ -50,53 +75,255 @@ def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp= None):
     
     # --- 2. Ripple Band Features (125-250 Hz) ---
     ripple_power = event.get('ripple_power', 0)
-    features['ripple_power'] = ripple_power
+    # Ensure ripple_power is scalar (take mean if array)
+    if isinstance(ripple_power, np.ndarray):
+        ripple_power = np.mean(ripple_power)
+    features['ripple_power'] = float(ripple_power)
     features['ripple_power_log'] = np.log1p(ripple_power)
-    features['ripple_peak_freq'] = event.get('peak_frequency', 0)
+    
+    # Extract peak frequency from spectrogram if available
+    if 'spectrogram' in event and event['spectrogram'] is not None:
+        spec = event['spectrogram']
+        freqs = event.get('spectrogram_freqs')
+        
+        if freqs is not None and isinstance(spec, np.ndarray) and spec.size > 0:
+            # Handle both 2D (STFT/CWT) and 1D (multitaper) spectrograms
+            if spec.ndim == 2:
+                # 2D spectrogram: average power across time to get frequency profile
+                freq_profile = np.mean(spec, axis=1)
+            elif spec.ndim == 1:
+                # 1D PSD (multitaper): use directly
+                freq_profile = spec
+            else:
+                freq_profile = None
+            
+            if freq_profile is not None and len(freq_profile) == len(freqs):
+                # Find frequency with maximum power
+                peak_freq_idx = np.argmax(freq_profile)
+                features['ripple_peak_freq'] = float(freqs[peak_freq_idx])
+            else:
+                # Fallback to stored value or default
+                features['ripple_peak_freq'] = float(event.get('peak_frequency', 150))
+        else:
+            # No valid frequency data
+            features['ripple_peak_freq'] = float(event.get('peak_frequency', 150))
+    else:
+        # No spectrogram available
+        features['ripple_peak_freq'] = float(event.get('peak_frequency', 150))
+    
     features['ripple_amplitude'] = event.get('ripple_amplitude', 0)
     
     # Ripple frequency band percentage
-    if 'peak_frequency' in event:
-        peak_freq = event['peak_frequency']
-        features['in_ripple_band'] = 1.0 if (125 <= peak_freq <= 250) else 0.0
-    else:
-        features['in_ripple_band'] = 0.0
+    peak_freq = features['ripple_peak_freq']
+    features['in_ripple_band'] = 1.0 if (125 <= peak_freq <= 250) else 0.0
     
     # --- 3. MUA Features ---
-    start_idx = int(event['start_time'] * fs)
-    end_idx = int(event['end_time'] * fs)
-    
+    start_idx = int(features['start_time'] * fs)
+    end_idx = int(features['end_time'] * fs)
+
     # Ensure indices are within bounds
     start_idx = max(0, start_idx)
     end_idx = min(len(mua_vec), end_idx)
-    
+
     if start_idx < end_idx:
         mua_segment = mua_vec[start_idx:end_idx]
-        features['mua_max'] = np.max(mua_segment)
-        features['mua_mean'] = np.mean(mua_segment)
-        features['mua_std'] = np.std(mua_segment)
-        features['mua_integral'] = np.trapz(mua_segment)
-        features['mua_peak_time'] = np.argmax(mua_segment) / len(mua_segment)
+        features['mua_max'] = float(np.max(mua_segment))
+        features['mua_mean'] = float(np.mean(mua_segment))
+        features['mua_std'] = float(np.std(mua_segment))
+        features['mua_integral'] = float(np.trapz(mua_segment))
+        features['mua_peak_time'] = float(np.argmax(mua_segment) / max(1, len(mua_segment)))
     else:
+        mua_segment = np.array([])
         features['mua_max'] = 0.0
         features['mua_mean'] = 0.0
         features['mua_std'] = 0.0
         features['mua_integral'] = 0.0
         features['mua_peak_time'] = 0.5
+
+    # Context windows (pre/post) in samples
+    pre_samples = ms_to_samples(pre_ms, fs)
+    post_samples = ms_to_samples(post_ms, fs)
+
+    pre_start = max(0, start_idx - pre_samples)
+    pre_end = start_idx
+    post_start = end_idx
+    post_end = min(len(mua_vec), end_idx + post_samples)
+
+    # --- New: contextual MUA features (pre / post) ---
+    if pre_end > pre_start:
+        mua_pre = mua_vec[pre_start:pre_end]
+        features['pre_mua_mean'] = float(np.mean(mua_pre))
+        features['pre_mua_max'] = float(np.max(mua_pre))
+        features['pre_mua_integral'] = float(np.trapz(mua_pre))
+    else:
+        features['pre_mua_mean'] = 0.0
+        features['pre_mua_max'] = 0.0
+        features['pre_mua_integral'] = 0.0
+
+    if post_end > post_start:
+        mua_post = mua_vec[post_start:post_end]
+        features['post_mua_mean'] = float(np.mean(mua_post))
+        features['post_mua_max'] = float(np.max(mua_post))
+        features['post_mua_integral'] = float(np.trapz(mua_post))
+    else:
+        features['post_mua_mean'] = 0.0
+        features['post_mua_max'] = 0.0
+        features['post_mua_integral'] = 0.0
     
-    # --- 4. Ripple-MUA Coupling ---
-    if 'ripple_envelope' in event and len(event['ripple_envelope']) > 0:
-        ripple_env = event['ripple_envelope'][start_idx:end_idx]
-        if len(ripple_env) == len(mua_segment) and len(mua_segment) > 1:
+    # --- NEW: Sharp-wave (0.5-20 Hz) features ---
+    try:
+        # Prefer using the averaged / first channel if multichannel provided
+        if lfp_array is None:
+            sw_seg = np.array([])
+        else:
+            if getattr(lfp_array, 'ndim', 1) == 1:
+                lfp_for_sw = lfp_array
+            else:
+                # Take first channel as canonical slow-wave reference
+                lfp_for_sw = lfp_array[0]
+
+            # Band for sharp-wave: use 0.5-20 Hz (avoid exact 0 Hz DC)
+            low_sw, high_sw = 0.5, 20.0
+            b_sw, a_sw = butter(3, [low_sw / (fs/2), high_sw / (fs/2)], btype='band')
+            sw_filtered = filtfilt(b_sw, a_sw, lfp_for_sw)
+            sw_seg = sw_filtered[start_idx:end_idx] if end_idx > start_idx and end_idx <= len(sw_filtered) else sw_filtered[start_idx: min(len(sw_filtered), end_idx)]
+
+        if len(sw_seg) > 2:
+            # Analytic envelope
+            sw_env = np.abs(hilbert(sw_seg))
+            features['sharpwave_peak_amp'] = float(np.max(sw_seg))
+            features['sharpwave_peak_amp_abs'] = float(np.max(np.abs(sw_seg)))
+            features['sharpwave_env_mean'] = float(np.mean(sw_env))
+            features['sharpwave_mean_power'] = float(np.mean(sw_env**2))
+            features['sharpwave_area'] = float(np.trapz(np.abs(sw_seg)))
+
+            # slope (linear fit)
             try:
-                corr = np.corrcoef(ripple_env, mua_segment)[0, 1]
-                features['ripple_mua_correlation'] = corr if not np.isnan(corr) else 0.0
-            except:
+                from scipy import stats as _stats
+                tvec = np.arange(len(sw_seg)) / fs
+                slope = float(_stats.linregress(tvec, sw_seg).slope)
+                features['sharpwave_slope'] = slope
+            except Exception:
+                features['sharpwave_slope'] = 0.0
+
+            # polarity: +1 (positive deflection) or -1 (negative)
+            features['sharpwave_polarity'] = float(np.sign(np.mean(sw_seg)))
+
+            # peak latency relative to event (fraction)
+            peak_idx = int(np.argmax(np.abs(sw_seg)))
+            features['sharpwave_peak_latency'] = float(peak_idx) / max(1, len(sw_seg))
+
+            # attach envelope into the event dict for downstream use (PAC, plotting)
+            # store envelope on the event for later use
+            try:
+                event['sharpwave_envelope'] = sw_env.tolist()
+            except Exception:
+                event['sharpwave_envelope'] = np.array(sw_env)
+        else:
+            features['sharpwave_peak_amp'] = 0.0
+            features['sharpwave_peak_amp_abs'] = 0.0
+            features['sharpwave_env_mean'] = 0.0
+            features['sharpwave_mean_power'] = 0.0
+            features['sharpwave_area'] = 0.0
+            features['sharpwave_slope'] = 0.0
+            features['sharpwave_polarity'] = 0.0
+            features['sharpwave_peak_latency'] = 0.5
+            event['sharpwave_envelope'] = []
+    except Exception:
+        # fail-safe: populate zeros so feature vector keeps consistent length
+        features['sharpwave_peak_amp'] = 0.0
+        features['sharpwave_peak_amp_abs'] = 0.0
+        features['sharpwave_env_mean'] = 0.0
+        features['sharpwave_mean_power'] = 0.0
+        features['sharpwave_area'] = 0.0
+        features['sharpwave_slope'] = 0.0
+        features['sharpwave_polarity'] = 0.0
+        features['sharpwave_peak_latency'] = 0.5
+        event['sharpwave_envelope'] = []
+    # --- NEW: Sharp-wave phase at ripple peak and basic PAC (Modulation Index) ---
+    try:
+        # Need both sharp-wave phase and ripple envelope aligned to the event
+        sw_phase = None
+        rip_seg = None
+        if 'sharpwave_envelope' in event and getattr(event['sharpwave_envelope'], '__len__', None) and len(event['sharpwave_envelope']) >= (end_idx - start_idx):
+            # If we have stored sw_filtered above, compute phase from sw_seg; else try to reconstruct
+            if 'sw_seg' in locals() and len(sw_seg) == (end_idx - start_idx):
+                sw_phase = np.angle(hilbert(sw_seg))
+            else:
+                # fallback: compute phase from envelope by Hilbert on smoothed envelope (least preferred)
+                try:
+                    sw_env = np.array(event['sharpwave_envelope'])
+                    sw_phase = np.angle(hilbert(sw_env))
+                except Exception:
+                    sw_phase = None
+
+        if 'ripple_envelope' in event and getattr(event['ripple_envelope'], '__len__', None) and len(event['ripple_envelope']) > 0:
+            rip_env = np.array(event['ripple_envelope'])
+            rip_seg = rip_env[start_idx:end_idx] if len(rip_env) >= end_idx else rip_env[start_idx: min(len(rip_env), end_idx)]
+
+        # Phase at ripple peak (sharp-wave phase)
+        if sw_phase is not None and rip_seg is not None and len(rip_seg) == len(sw_phase) and len(rip_seg) > 0:
+            peak_idx = int(np.argmax(rip_seg))
+            if 0 <= peak_idx < len(sw_phase):
+                features['sharpwave_phase_at_ripple_peak'] = float(sw_phase[peak_idx])
+            else:
+                features['sharpwave_phase_at_ripple_peak'] = 0.0
+
+            # Compute Tort-style Modulation Index (MI) with 18 phase bins
+            try:
+                n_bins = 18
+                bins = np.linspace(-np.pi, np.pi, n_bins + 1)
+                inds = np.digitize(sw_phase, bins) - 1
+                mean_amp = np.zeros(n_bins, dtype=float)
+                for b in range(n_bins):
+                    mask = inds == b
+                    if np.any(mask):
+                        mean_amp[b] = np.mean(rip_seg[mask])
+                    else:
+                        mean_amp[b] = 0.0
+                mean_amp += 1e-10
+                mean_amp /= mean_amp.sum()
+                uniform = np.ones(n_bins) / n_bins
+                kl = np.sum(mean_amp * np.log(mean_amp / uniform))
+                mi = kl / np.log(n_bins)
+                features['sharpwave_ripple_modulation_index'] = float(mi)
+            except Exception:
+                features['sharpwave_ripple_modulation_index'] = 0.0
+        else:
+            features['sharpwave_phase_at_ripple_peak'] = 0.0
+            features['sharpwave_ripple_modulation_index'] = 0.0
+    except Exception:
+        features['sharpwave_phase_at_ripple_peak'] = 0.0
+        features['sharpwave_ripple_modulation_index'] = 0.0
+    
+    # --- 4. Ripple-MUA Coupling & contextual envelope features ---
+    if 'ripple_envelope' in event and hasattr(event['ripple_envelope'], '__len__') and len(event['ripple_envelope']) > 0:
+        env = np.array(event['ripple_envelope'])
+        # event envelope segment
+        env_seg = env[start_idx:end_idx] if len(env) >= end_idx else env[start_idx: min(len(env), end_idx)]
+        if len(env_seg) == len(mua_segment) and len(mua_segment) > 1:
+            try:
+                corr = np.corrcoef(env_seg, mua_segment)[0, 1]
+                features['ripple_mua_correlation'] = float(corr) if not np.isnan(corr) else 0.0
+            except Exception:
                 features['ripple_mua_correlation'] = 0.0
         else:
             features['ripple_mua_correlation'] = 0.0
+
+        # contextual envelope (pre / post)
+        env_pre = env[pre_start:pre_end] if (pre_end > pre_start and len(env) >= pre_end) else (env[pre_start:pre_end] if pre_end>pre_start else np.array([]))
+        env_post = env[post_start:post_end] if (post_end > post_start and len(env) >= post_end) else (env[post_start:post_end] if post_end>post_start else np.array([]))
+
+        features['pre_ripple_env_mean'] = float(np.mean(env_pre)) if getattr(env_pre, 'size', 0) else 0.0
+        features['post_ripple_env_mean'] = float(np.mean(env_post)) if getattr(env_post, 'size', 0) else 0.0
+        features['power_ratio_event_to_pre'] = float(np.mean(env_seg) / (np.mean(env_pre) + 1e-10)) if getattr(env_pre, 'size', 0) else 0.0
+        features['power_ratio_event_to_post'] = float(np.mean(env_seg) / (np.mean(env_post) + 1e-10)) if getattr(env_post, 'size', 0) else 0.0
     else:
         features['ripple_mua_correlation'] = 0.0
+        features['pre_ripple_env_mean'] = 0.0
+        features['post_ripple_env_mean'] = 0.0
+        features['power_ratio_event_to_pre'] = 0.0
+        features['power_ratio_event_to_post'] = 0.0
     
     # --- 5. Spectral Features from Spectrogram ---
     if 'spectrogram' in event and event['spectrogram'] is not None:
@@ -200,7 +427,7 @@ def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp= None):
         else:
             features['slow_phase_at_peak'] = 0.0
             features['phase_locking_value'] = 0.0
-    except Exception as e:
+    except Exception:
         features['slow_phase_at_peak'] = 0.0
         features['phase_locking_value'] = 0.0
     
@@ -273,7 +500,7 @@ def extract_multichannel_features(event, region_lfp, fs):
                     try:
                         corr = np.corrcoef(seg0, seg1)[0, 1]
                         features['channel_correlation'] = corr if not np.isnan(corr) else 0.0
-                    except:
+                    except Exception:
                         features['channel_correlation'] = 0.0
                 else:
                     features['channel_correlation'] = 0.0
@@ -289,7 +516,7 @@ def extract_multichannel_features(event, region_lfp, fs):
                             corr = np.corrcoef(channel_segments[i, :], channel_segments[j, :])[0, 1]
                             if not np.isnan(corr):
                                 coherences.append(corr)
-                        except:
+                        except Exception:
                             pass
                 features['mean_spatial_coherence'] = np.mean(coherences) if coherences else 0.0
             else:
@@ -314,7 +541,7 @@ def extract_multichannel_features(event, region_lfp, fs):
     return features
 
 
-def batch_extract_features(events, lfp_array, mua_vec, fs, region_lfp=None, verbose=True):
+def batch_extract_features(events, lfp_array, mua_vec, fs, region_lfp=None, verbose=True, normalize_lfp=True, pre_ms=100, post_ms=100):
     """
     Extract features for all events in batch.
     
@@ -341,27 +568,44 @@ def batch_extract_features(events, lfp_array, mua_vec, fs, region_lfp=None, verb
         List of feature names
     """
     
+    # Optionally normalize LFP and region_lfp
+    if normalize_lfp and lfp_array is not None:
+        lfp_array = zscore_lfp(lfp_array)
+    if normalize_lfp and region_lfp is not None:
+        norm_region = {}
+        for k, v in region_lfp.items():
+            norm_region[k] = zscore_lfp(v)
+        region_lfp = norm_region
+
     all_features = []
     feature_names = None
-    
+
     for i, event in enumerate(events):
         if verbose and i % 100 == 0:
             print(f"Extracting features: {i}/{len(events)}...")
-        
-        features = extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp)
-        
+
+        features = extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp, pre_ms=pre_ms, post_ms=post_ms)
+
         if feature_names is None:
             feature_names = sorted(features.keys())
-        
-        # Create feature vector in consistent order
-        feature_vector = [features[name] for name in feature_names]
+
+        # Create feature vector in consistent order, force scalar conversion and debug non-scalars
+        feature_vector = []
+        for j, name in enumerate(feature_names):
+            val = features[name]
+            if isinstance(val, (list, tuple, np.ndarray)):
+                print(f"Non-scalar feature at event {i}, feature '{name}': type={type(val)}, value={val}")
+            try:
+                feature_vector.append(float(val))
+            except Exception:
+                feature_vector.append(np.nan)
         all_features.append(feature_vector)
-    
+
     feature_matrix = np.array(all_features)
-    
+
     if verbose:
         print(f"Extracted {feature_matrix.shape[1]} features from {feature_matrix.shape[0]} events")
-    
+
     return feature_matrix, feature_names
 
 
@@ -389,15 +633,33 @@ def validate_biological_features(feature_matrix, feature_names):
         if n_nan > 0 or n_inf > 0:
             print(f"⚠️  {name}: {n_nan} NaNs, {n_inf} Infs")
         
-        # Check ranges for key features
+        # Check ranges for key features (always show, not just warnings)
         if 'ripple_peak_freq' in name:
-            out_of_range = np.sum((values < 100) | (values > 300))
+            in_range = np.sum((values >= 100) & (values <= 300))
+            out_of_range = len(values) - in_range
             if out_of_range > len(values) * 0.5:
-                print(f"⚠️  {name}: {out_of_range}/{len(values)} values outside typical ripple range (100-300 Hz)")
+                print(f"⚠️  {name}: {in_range}/{len(values)} in range (100-300 Hz), {out_of_range}/{len(values)} outside")
+            else:
+                print(f"✓  {name}: {in_range}/{len(values)} in range (100-300 Hz), {out_of_range}/{len(values)} outside")
         
         if 'duration' in name:
-            out_of_range = np.sum((values < 0.015) | (values > 0.5))
+            in_range = np.sum((values >= 0.015) & (values <= 0.5))
+            out_of_range = len(values) - in_range
             if out_of_range > len(values) * 0.1:
-                print(f"⚠️  {name}: {out_of_range}/{len(values)} values outside typical SWR duration (15-500ms)")
+                print(f"⚠️  {name}: {in_range}/{len(values)} in range (15-500ms), {out_of_range}/{len(values)} outside")
+            else:
+                print(f"✓  {name}: {in_range}/{len(values)} in range (15-500ms), {out_of_range}/{len(values)} outside")
+        
+        if 'ripple_power' in name and 'log' not in name:
+            # Show distribution stats for ripple power
+            mean_val = np.mean(values)
+            std_val = np.std(values)
+            print(f"ℹ️  {name}: mean={mean_val:.3f}, std={std_val:.3f}, range=[{np.min(values):.3f}, {np.max(values):.3f}]")
+        
+        if 'mua_max' in name or 'mua_mean' in name:
+            # Show distribution stats for MUA features
+            mean_val = np.mean(values)
+            std_val = np.std(values)
+            print(f"ℹ️  {name}: mean={mean_val:.3f}, std={std_val:.3f}, range=[{np.min(values):.3f}, {np.max(values):.3f}]")
     
     print("Validation complete.\n")
