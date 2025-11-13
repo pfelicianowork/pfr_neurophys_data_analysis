@@ -77,15 +77,20 @@ def validate_clusters_biologically(events_df, feature_names=None):
         # 2. Ripple Frequency Analysis
         if 'ripple_peak_freq' in cluster_events.columns:
             peak_freqs = cluster_events['ripple_peak_freq'].values
-            peak_freqs = peak_freqs[peak_freqs > 0]  # Remove zeros
+            # Ensure it's a numpy array
+            if not isinstance(peak_freqs, np.ndarray):
+                peak_freqs = np.array(peak_freqs)
+            # Remove zeros, NaN, and infinite values
+            mask = ~np.isnan(peak_freqs) & ~np.isinf(peak_freqs) & (peak_freqs > 0)
+            peak_freqs = peak_freqs[mask]
             
             if len(peak_freqs) > 0:
-                results['peak_freq_mean'] = np.mean(peak_freqs)
-                results['peak_freq_std'] = np.std(peak_freqs)
+                results['peak_freq_mean'] = float(np.mean(peak_freqs))
+                results['peak_freq_std'] = float(np.std(peak_freqs))
                 
                 # Check if in ripple band (125-250 Hz)
                 in_ripple_band = np.sum((peak_freqs >= 125) & (peak_freqs <= 250))
-                results['ripple_band_pct'] = 100 * in_ripple_band / len(peak_freqs)
+                results['ripple_band_pct'] = float(100 * in_ripple_band / len(peak_freqs))
                 
                 print(f"\n2. Ripple Frequency Analysis:")
                 print(f"   Mean peak frequency: {results['peak_freq_mean']:.1f} Hz")
@@ -101,13 +106,23 @@ def validate_clusters_biologically(events_df, feature_names=None):
         
         # 3. MUA-Ripple Correlation Analysis
         if 'ripple_mua_correlation' in cluster_events.columns:
-            mua_corrs = cluster_events['ripple_mua_correlation'].values
-            mua_corrs = mua_corrs[~np.isnan(mua_corrs)]
+            mua_corrs_raw = cluster_events['ripple_mua_correlation'].values
+            
+            flat_corrs = []
+            for item in mua_corrs_raw:
+                if isinstance(item, (list, np.ndarray)):
+                    for sub_item in item:
+                        if isinstance(sub_item, (int, float)) and not np.isnan(sub_item):
+                            flat_corrs.append(sub_item)
+                elif isinstance(item, (int, float)) and not np.isnan(item):
+                    flat_corrs.append(item)
+            
+            mua_corrs = np.array(flat_corrs)
             
             if len(mua_corrs) > 0:
-                results['mean_mua_corr'] = np.mean(mua_corrs)
-                results['std_mua_corr'] = np.std(mua_corrs)
-                results['positive_corr_pct'] = 100 * np.sum(mua_corrs > 0) / len(mua_corrs)
+                results['mean_mua_corr'] = float(np.mean(mua_corrs))
+                results['std_mua_corr'] = float(np.std(mua_corrs))
+                results['positive_corr_pct'] = float(100 * np.sum(mua_corrs > 0) / len(mua_corrs))
                 
                 print(f"\n3. MUA-Ripple Coupling:")
                 print(f"   Mean correlation: {results['mean_mua_corr']:.3f}")
@@ -123,12 +138,25 @@ def validate_clusters_biologically(events_df, feature_names=None):
         
         # 4. Ripple Power Analysis
         if 'ripple_power' in cluster_events.columns:
-            powers = cluster_events['ripple_power'].values
+            powers_raw = cluster_events['ripple_power'].values
+            
+            flat_powers = []
+            for item in powers_raw:
+                if isinstance(item, (list, np.ndarray)):
+                    for sub_item in item:
+                        if isinstance(sub_item, (int, float)) and not np.isnan(sub_item) and np.isfinite(sub_item):
+                            flat_powers.append(sub_item)
+                elif isinstance(item, (int, float)) and not np.isnan(item) and np.isfinite(item):
+                    flat_powers.append(item)
+            
+            powers = np.array(flat_powers)
+            
+            # Filter out non-positive values
             powers = powers[powers > 0]
             
             if len(powers) > 0:
-                results['mean_ripple_power'] = np.mean(powers)
-                results['std_ripple_power'] = np.std(powers)
+                results['mean_ripple_power'] = float(np.mean(powers))
+                results['std_ripple_power'] = float(np.std(powers))
                 
                 print(f"\n4. Ripple Power:")
                 print(f"   Mean: {results['mean_ripple_power']:.3f}")
@@ -159,11 +187,16 @@ def validate_clusters_biologically(events_df, feature_names=None):
         # 6. Spectral Characteristics
         if 'spec_entropy' in cluster_events.columns:
             entropies = cluster_events['spec_entropy'].values
-            entropies = entropies[entropies > 0]
+            # Ensure it's a numpy array
+            if not isinstance(entropies, np.ndarray):
+                entropies = np.array(entropies)
+            # Remove zeros, NaN, and infinite values
+            mask = ~np.isnan(entropies) & ~np.isinf(entropies) & (entropies > 0)
+            entropies = entropies[mask]
             
             if len(entropies) > 0:
-                results['mean_spec_entropy'] = np.mean(entropies)
-                results['std_spec_entropy'] = np.std(entropies)
+                results['mean_spec_entropy'] = float(np.mean(entropies))
+                results['std_spec_entropy'] = float(np.std(entropies))
                 
                 print(f"\n6. Spectral Entropy:")
                 print(f"   Mean: {results['mean_spec_entropy']:.3f}")
@@ -255,9 +288,18 @@ def compare_clusters_statistically(events_df, feature_cols=None):
         # Collect data per cluster
         cluster_data = []
         for cid in cluster_ids:
-            data = events_df[events_df['cluster_id'] == cid][feature].values
-            data = data[~np.isnan(data)]
-            cluster_data.append(data)
+            data_raw = events_df[events_df['cluster_id'] == cid][feature].values
+            
+            flat_data = []
+            for item in data_raw:
+                if isinstance(item, (list, np.ndarray)):
+                    for sub_item in item:
+                        if isinstance(sub_item, (int, float)) and not np.isnan(sub_item) and np.isfinite(sub_item):
+                            flat_data.append(sub_item)
+                elif isinstance(item, (int, float)) and not np.isnan(item) and np.isfinite(item):
+                    flat_data.append(item)
+            
+            cluster_data.append(np.array(flat_data))
         
         # ANOVA test
         if len(cluster_data) > 1 and all(len(d) > 0 for d in cluster_data):
@@ -317,11 +359,27 @@ def plot_cluster_characteristics(events_df, save_prefix='cluster'):
     
     for ax, (feature, label, use_log) in zip(axes.flat, features_to_plot):
         if feature in events_df.columns:
-            data = [events_df[events_df['cluster_id'] == cid][feature].dropna().values 
-                    for cid in cluster_ids]
+            # Clean and flatten data for each cluster
+            cleaned_data = []
+            for cid in cluster_ids:
+                data_raw = events_df[events_df['cluster_id'] == cid][feature].values
+                
+                flat_data = []
+                for item in data_raw:
+                    if isinstance(item, (list, np.ndarray)):
+                        for sub_item in item:
+                            if isinstance(sub_item, (int, float)) and not np.isnan(sub_item) and np.isfinite(sub_item):
+                                flat_data.append(sub_item)
+                    elif isinstance(item, (int, float)) and not np.isnan(item) and np.isfinite(item):
+                        flat_data.append(item)
+                
+                cleaned_data.append(np.array(flat_data))
+            
+            data = cleaned_data
             
             if use_log:
-                data = [np.log10(d + 1) for d in data]
+                # Ensure we don't take log of negative numbers, add 1 to avoid log(0)
+                data = [np.log10(d[d >= 0] + 1) for d in data]
                 label = f'Log10({label})'
             
             bp = ax.boxplot(data, labels=cluster_ids, patch_artist=True)
@@ -356,9 +414,37 @@ def plot_cluster_characteristics(events_df, save_prefix='cluster'):
     if 'duration' in events_df.columns and 'ripple_power' in events_df.columns:
         for cid in cluster_ids:
             cluster_data = events_df[events_df['cluster_id'] == cid]
+            # Ensure duration and ripple_power are scalars for matplotlib
+            durations = cluster_data['duration'].values
+            ripple_powers = cluster_data['ripple_power'].values
+            
+            # Convert to scalar arrays
+            durations_scalar = []
+            ripple_powers_scalar = []
+            
+            for d, r in zip(durations, ripple_powers):
+                # Handle duration
+                if isinstance(d, np.ndarray):
+                    durations_scalar.append(float(np.mean(d)) if d.size > 0 else 0.0)
+                elif hasattr(d, '__iter__') and not isinstance(d, (str, bytes)):
+                    durations_scalar.append(float(np.mean(list(d))) if len(list(d)) > 0 else 0.0)
+                else:
+                    durations_scalar.append(float(d))
+                
+                # Handle ripple_power
+                if isinstance(r, np.ndarray):
+                    ripple_powers_scalar.append(float(np.mean(r)) if r.size > 0 else 0.0)
+                elif hasattr(r, '__iter__') and not isinstance(r, (str, bytes)):
+                    ripple_powers_scalar.append(float(np.mean(list(r))) if len(list(r)) > 0 else 0.0)
+                else:
+                    ripple_powers_scalar.append(float(r))
+            
+            durations_scalar = np.array(durations_scalar)
+            ripple_powers_scalar = np.array(ripple_powers_scalar)
+            
             axes[1].scatter(
-                cluster_data['duration']*1000,
-                cluster_data['ripple_power'],
+                durations_scalar * 1000,
+                ripple_powers_scalar,
                 alpha=0.6,
                 s=30,
                 label=f'Cluster {cid}'

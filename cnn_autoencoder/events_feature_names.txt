@@ -1,0 +1,103 @@
+# Event Feature Descriptions
+
+This file provides descriptions for the features extracted from detected neurophysiological events, such as sharp-wave ripples (SWRs).
+
+---
+## 1. Temporal Features
+- **duration**: The total duration of the event in seconds.
+- **start_time**: The start time of the event in seconds from the beginning of the recording.
+- **end_time**: The end time of the event in seconds.
+- **peak_time_normalized**: The time of the event's peak, normalized to the event's duration (0 to 1). A value of 0.5 means the peak occurred in the middle of the event.
+
+---
+## 2. Ripple Band Features (125-250 Hz)
+- **ripple_power**: The mean of the normalized envelope power (z-scored) of the ripple-band-filtered LFP segment for the event (with extension).
+- **ripple_peak_freq**: The frequency with the highest power within the ripple band.
+- **ripple_amplitude**: The peak amplitude of the ripple-band-filtered LFP signal.
+- **in_ripple_band**: A binary feature (1.0 or 0.0) indicating if the `ripple_peak_freq` is within the canonical ripple band (125-250 Hz).
+
+- **envelope_asymmetry**: (decay_time - rise_time) / (decay_time + rise_time), where rise_time is the time from event start to envelope peak, and decay_time is from peak to event end.
+- **envelope_kurtosis**: Kurtosis of the normalized envelope power.
+- **envelope_area**: Area under the normalized envelope power curve.
+- **envelope_curvature**: Mean absolute value of the second derivative (curvature) of the normalized envelope power.
+
+---
+## 3. Multi-Unit Activity (MUA) Features
+- **mua_max**: The maximum MUA value during the event.
+- **mua_mean**: The average MUA value during the event.
+- **mua_std**: The standard deviation of the MUA during the event.
+- **mua_integral**: The area under the MUA curve during the event, approximating total firing.
+- **mua_peak_time**: The normalized time of the MUA peak within the event.
+
+
+---
+## 4. Sharp-Wave Features (0.5-20 Hz)
+- **sharpwave_peak_amp**: The peak amplitude of the sharp-wave-filtered LFP.
+- **sharpwave_peak_amp_abs**: The peak of the absolute value of the sharp-wave-filtered LFP.
+- **sharpwave_env_mean**: The mean of the envelope of the sharp-wave-filtered LFP.
+- **sharpwave_symmetry**: (decay_time - rise_time) / (decay_time + rise_time), where rise_time is the time from event start to sharp-wave peak, and decay_time is from peak to event end.
+- **sharpwave_curvature**: Mean absolute value of the second derivative (curvature) of the sharp-wave segment.
+- **sharpwave_kurtosis**: Kurtosis of the sharp-wave segment.
+- **sharpwave_area**: The area under the absolute sharp-wave signal.
+- **sharpwave_slope**: The slope of a linear fit to the sharp-wave, indicating its steepness.
+- **sharpwave_polarity**: The polarity of the sharp-wave (+1 for positive, -1 for negative deflection).
+- **sharpwave_peak_latency**: The normalized time of the sharp-wave peak within the event.
+
+---
+## 5. Phase-Amplitude Coupling (PAC) Features
+- **sharpwave_phase_at_ripple_peak**: The phase of the sharp-wave at the time of the ripple peak.
+- **sharpwave_ripple_modulation_index**: A measure of how much the ripple amplitude is modulated by the sharp-wave phase (Tort's Modulation Index).
+
+---
+## 6. Ripple-MUA Coupling Features
+- **ripple_mua_correlation**: The correlation coefficient between the ripple envelope and the MUA signal during the event.
+- **pre_ripple_env_mean**: The mean of the ripple envelope in the window before the event.
+- **post_ripple_env_mean**: The mean of the ripple envelope in the window after the event.
+- **power_ratio_event_to_pre**: The ratio of the mean ripple envelope during the event to the mean envelope before.
+- **power_ratio_event_to_post**: The ratio of the mean ripple envelope during the event to the mean envelope after.
+
+---
+## 7. Spectral Features (from Spectrogram)
+- **spec_entropy**: The entropy of the event's spectrogram, measuring spectral complexity.
+- **spec_peak_power**: The maximum power value in the spectrogram.
+- **spec_mean_power**: The average power across the entire spectrogram.
+- **spec_centroid**: The frequency-domain center of mass of the spectrogram.
+- **spec_spread**: The standard deviation of the spectrogram's power distribution in frequency.
+
+- **frequency_chirp**: The change in peak frequency between the second half and the first half of the event's resampled spectrogram, 
+normalized by the event window duration (Hz per second). Positive values indicate an upsweep (higher frequency later in the event); 
+negative values indicate a downsweep.
+
+---
+## 8. Waveform Shape Features (Raw LFP)
+- **lfp_kurtosis**: The kurtosis of the raw LFP segment, measuring "tailedness" of the amplitude distribution.
+- **lfp_skewness**: The skewness of the raw LFP segment, measuring asymmetry of the amplitude distribution.
+- **lfp_peak_to_peak**: The difference between the maximum and minimum LFP amplitude in the event.
+- **lfp_std**: The standard deviation of the LFP during the event.
+- **lfp_rms**: The root mean square of the LFP during the event.
+
+---
+## 9. Slow Oscillation Features (0.5-4 Hz)
+- **slow_phase_at_peak**: The phase of the slow oscillation at the peak of the event (computed in the 0.5–4 Hz band).
+- **phase_locking_value**: A measure of phase consistency of the slow oscillation during the event (e.g., PLV over the event window).
+
+- **slow_wave_phase_at_event_peak**: Phase of the 0.5–4 Hz slow oscillation at the event center (used as a robust event-phase estimate).
+- **slow_wave_phase_at_ripple_peak**: Phase of the 0.5–4 Hz slow oscillation at the time of the ripple-envelope peak (useful for PAC analyses).
+
+---
+## 10. Multi-Channel Spatial Features
+- **spatial_power_variance**: The variance of signal power across different channels.
+- **spatial_power_mean**: The mean of signal power across different channels.
+- **max_channel_idx**: The index of the channel with the maximum power (normalized).
+- **power_gradient**: The maximum absolute difference in power between adjacent channels.
+- **channel_correlation**: The correlation between the signals of two primary channels.
+- **mean_spatial_coherence**: The average correlation across pairs of channels.
+
+Notes on channel_correlation (implementation details):
+- The extractor computes `channel_correlation` from the multi-channel region LFP (typically `region_lfp['CA1']`) by taking the event-time segment from the two primary CA1 channels and computing the Pearson correlation (implemented with `np.corrcoef`). This correlation is computed per-event over the event window, so different events (different time windows) can produce different correlation values.
+- If you pass a single-channel trace as `lfp_channel` to `batch_extract_features` but also provide a `region_lfp` that contains multiple channels (e.g., shape `(2, N)`), the extractor will still compute `channel_correlation` from `region_lfp` (hence non-zero and varying values). If `region_lfp` is missing or contains only one channel, the current implementation sets `channel_correlation` to `0.0`.
+- If you want `channel_correlation` to be zero when you're intentionally using a single LFP trace, either call `batch_extract_features(..., region_lfp=None)` or make sure `region_lfp['CA1']` contains only one channel (e.g., `region_lfp['CA1'] = region_lfp['CA1'][0:1]`). Alternatively, modify `extract_multichannel_features` to fall back to the supplied single-channel `lfp_array` (or return `np.nan`) when multi-channel data are not available.
+
+---
+## 11. Signal Quality Metrics
+- **snr_estimate**: An estimate of the signal-to-noise ratio of the LFP segment during the event.

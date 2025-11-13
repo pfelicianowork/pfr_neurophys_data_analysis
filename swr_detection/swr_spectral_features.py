@@ -235,7 +235,7 @@ def _cwt_optimized(lfp_seg, fs, freqs, method='full', boundary='mirror', n_worke
     return cwt_matrix
 
 
-def compute_event_spectral_features(event, lfp_array, fs, nperseg=256, noverlap=None, freq_range=(100, 250), n_bins=20, pad_to=None, smoothing_sigma=1.5, pre_ms=200, post_ms=200, target_freq_bins=None, use_optimized_cwt=True, n_workers=None, verbose=False):
+def compute_event_spectral_features(event, lfp_array, fs, nperseg=256, noverlap=None, freq_range=(100, 250), n_bins=20, pad_to=None, smoothing_sigma=1.5, pre_ms=200, post_ms=200, target_freq_bins=None, use_optimized_cwt=True, n_workers=None, verbose=False, use_gpu='auto', gpu_batch_size='auto'):
     """
     Compute high-res, smoothed, frequency-masked, and padded spectrogram for a single event.
     Always uses ±pre_ms/post_ms (in ms) window around event peak.
@@ -250,6 +250,11 @@ def compute_event_spectral_features(event, lfp_array, fs, nperseg=256, noverlap=
         Number of parallel workers for CWT (default: all CPUs)
     verbose : bool, optional
         Show CWT progress bar
+    use_gpu : bool or 'auto', optional
+        If 'auto', detect GPU availability. If True, force GPU (raise error if unavailable).
+        If False, use CPU only.
+    gpu_batch_size : int or 'auto', optional
+        Frequencies per GPU batch. 'auto' estimates based on available VRAM.
     """
     import numpy as np
     from scipy.signal import spectrogram
@@ -271,6 +276,97 @@ def compute_event_spectral_features(event, lfp_array, fs, nperseg=256, noverlap=
     
     spec_method = event.get('spec_method', 'stft') if 'spec_method' in event else 'stft'
     
+    # ========== GPU ACCELERATION (PHASE 3: INTEGRATION) ==========
+    if spec_method == 'cwt':
+        # GPU availability check
+        if use_gpu == 'auto':
+            try:
+                from .gpu_utils import check_gpu_availability
+                has_cupy, has_cuda, _, _ = check_gpu_availability()
+                use_gpu_actual = has_cupy and has_cuda
+            except ImportError:
+                use_gpu_actual = False
+        else:
+            use_gpu_actual = use_gpu
+        
+        # Try GPU first if enabled
+        if use_gpu_actual:
+            try:
+                from .swr_spectral_features_gpu import _cwt_optimized_gpu
+                from .gpu_utils import get_optimal_gpu_batch_size
+                
+                # Auto-estimate batch size based on available VRAM
+                if gpu_batch_size == 'auto':
+                    min_freq, max_freq = freq_range
+                    num_freqs = target_freq_bins if target_freq_bins else max(20, int((max_freq - min_freq) / 2.0))
+                    gpu_batch_size = get_optimal_gpu_batch_size(num_freqs, len(lfp_seg))
+                
+                # Setup frequencies
+                min_freq, max_freq = freq_range
+                if target_freq_bins:
+                    num_freqs = target_freq_bins
+                else:
+                    num_freqs = max(20, int((max_freq - min_freq) / 2.0))
+                
+                freqs = np.linspace(min_freq, max_freq, num_freqs)
+                nyquist = fs / 2.0
+                freqs = freqs[freqs < nyquist]
+                
+                if len(freqs) == 0:
+                    raise ValueError(f"No valid frequencies below Nyquist ({nyquist:.1f} Hz)!")
+                
+                # GPU CWT computation
+                Sxx = _cwt_optimized_gpu(
+                    lfp_seg, fs, freqs,
+                    boundary='mirror',
+                    max_freqs_per_batch=gpu_batch_size,
+                    verbose=verbose
+                )
+                f = freqs
+                
+                # Time axis resampling
+                t_norm = np.linspace(0, 1, Sxx.shape[1])
+                t_target = np.linspace(0, 1, n_bins)
+                Sxx_resampled = np.zeros((Sxx.shape[0], n_bins))
+                
+                for fi in range(Sxx.shape[0]):
+                    f_interp = interp1d(t_norm, Sxx[fi], kind='linear', bounds_error=False, fill_value=float(Sxx[fi][0]))
+                    Sxx_resampled[fi] = f_interp(t_target)
+                
+                # Apply smoothing
+                if smoothing_sigma is not None and smoothing_sigma > 0:
+                    import scipy.ndimage
+                    Sxx_resampled = scipy.ndimage.gaussian_filter(Sxx_resampled, sigma=[0, smoothing_sigma])
+                # Compute frequency chirp: difference between peak freq in second half vs first half normalized by duration
+                try:
+                    n_time = Sxx_resampled.shape[1]
+                    mid = n_time // 2
+                    if mid == 0:
+                        freq_first = freqs[np.argmax(Sxx_resampled.mean(axis=1))]
+                        freq_second = freq_first
+                    else:
+                        power_first = np.mean(Sxx_resampled[:, :mid], axis=1)
+                        power_second = np.mean(Sxx_resampled[:, mid:], axis=1)
+                        freq_first = freqs[int(np.argmax(power_first))] if power_first.size > 0 else np.nan
+                        freq_second = freqs[int(np.argmax(power_second))] if power_second.size > 0 else np.nan
+                    duration = max((win_end - win_start), 1e-6)
+                    frequency_chirp = float((freq_second - freq_first) / duration)
+                except Exception:
+                    frequency_chirp = np.nan
+                # Attach to event dict
+                event['frequency_chirp'] = frequency_chirp
+
+                return Sxx_resampled, f, t_target
+                
+            except Exception as e:
+                if use_gpu == True:  # Forced GPU mode
+                    raise RuntimeError(f"GPU CWT failed: {e}")
+                else:
+                    if verbose:
+                        warnings.warn(f"GPU CWT failed, falling back to CPU: {e}")
+                    # Fall through to CPU implementation below
+    
+    # ========== CPU IMPLEMENTATIONS (ORIGINAL CODE) ==========
     if spec_method == 'cwt' and use_optimized_cwt and HAS_PYFFTW:
         # --- Optimized PARALLEL CWT with pyfftw + Dask ---
         min_freq, max_freq = freq_range
@@ -314,7 +410,25 @@ def compute_event_spectral_features(event, lfp_array, fs, nperseg=256, noverlap=
         if smoothing_sigma is not None and smoothing_sigma > 0:
             import scipy.ndimage
             Sxx_resampled = scipy.ndimage.gaussian_filter(Sxx_resampled, sigma=[0, smoothing_sigma])
-        
+
+        # Compute frequency chirp and attach to event
+        try:
+            n_time = Sxx_resampled.shape[1]
+            mid = n_time // 2
+            if mid == 0:
+                freq_first = freqs[np.argmax(Sxx_resampled.mean(axis=1))]
+                freq_second = freq_first
+            else:
+                power_first = np.mean(Sxx_resampled[:, :mid], axis=1)
+                power_second = np.mean(Sxx_resampled[:, mid:], axis=1)
+                freq_first = freqs[int(np.argmax(power_first))] if power_first.size > 0 else np.nan
+                freq_second = freqs[int(np.argmax(power_second))] if power_second.size > 0 else np.nan
+            duration = max((win_end - win_start), 1e-6)
+            frequency_chirp = float((freq_second - freq_first) / duration)
+        except Exception:
+            frequency_chirp = np.nan
+        event['frequency_chirp'] = frequency_chirp
+
         return Sxx_resampled, f, t_target
         
     elif spec_method == 'cwt':
@@ -348,7 +462,25 @@ def compute_event_spectral_features(event, lfp_array, fs, nperseg=256, noverlap=
         if smoothing_sigma is not None and smoothing_sigma > 0:
             import scipy.ndimage
             Sxx_resampled = scipy.ndimage.gaussian_filter(Sxx_resampled, sigma=[0, smoothing_sigma])
-        
+
+        # Compute frequency chirp and attach to event
+        try:
+            n_time = Sxx_resampled.shape[1]
+            mid = n_time // 2
+            if mid == 0:
+                freq_first = freqs[np.argmax(Sxx_resampled.mean(axis=1))]
+                freq_second = freq_first
+            else:
+                power_first = np.mean(Sxx_resampled[:, :mid], axis=1)
+                power_second = np.mean(Sxx_resampled[:, mid:], axis=1)
+                freq_first = freqs[int(np.argmax(power_first))] if power_first.size > 0 else np.nan
+                freq_second = freqs[int(np.argmax(power_second))] if power_second.size > 0 else np.nan
+            duration = max((win_end - win_start), 1e-6)
+            frequency_chirp = float((freq_second - freq_first) / duration)
+        except Exception:
+            frequency_chirp = np.nan
+        event['frequency_chirp'] = frequency_chirp
+
         return Sxx_resampled, f, t_target
     
     else:
@@ -386,7 +518,7 @@ def compute_event_spectral_features(event, lfp_array, fs, nperseg=256, noverlap=
         return Sxx_resampled, f, t_target
 
 
-def batch_compute_spectral_features(detector, lfp_array, fs, use='basic', n_bins=20, freq_range=(100, 250), pad_to=None, pre_ms=200, post_ms=200, target_freq_bins=None, smoothing_sigma=1.5, use_optimized_cwt=True, n_workers=None, verbose=False, normalize_psd=False):
+def batch_compute_spectral_features(detector, lfp_array, fs, use='basic', n_bins=20, freq_range=(100, 250), pad_to=None, pre_ms=100, post_ms=100, target_freq_bins=None, smoothing_sigma=1.5, use_optimized_cwt=True, n_workers=None, verbose=False, normalize_psd=False, use_gpu='auto', gpu_batch_size='auto'):
     """
     Compute and attach spectrograms to all events in detector.swr_events.
     Supports STFT (default), CWT, and multi-taper spectral estimation.
@@ -406,12 +538,145 @@ def batch_compute_spectral_features(detector, lfp_array, fs, use='basic', n_bins
     smoothing_sigma : float, standard deviation for Gaussian smoothing (in bins)
     normalize_psd : bool, optional
         If True, normalize multitaper PSD to sum to 1 (useful for comparison)
+    use_gpu : bool or 'auto', optional
+        Enable GPU acceleration (requires CuPy). 'auto' detects availability.
+    gpu_batch_size : int or 'auto', optional
+        Frequencies per GPU batch. 'auto' estimates based on VRAM.
     """
     n_with_spec = 0
     method = getattr(detector, 'spectral_method', 'stft') if hasattr(detector, 'spectral_method') else 'stft'
     multitaper_kwargs = getattr(detector, 'multitaper_kwargs', {}) if hasattr(detector, 'multitaper_kwargs') else {}
     
-    for event in detector.swr_events:
+    # ========== PHASE 4: GPU BATCH PROCESSING ==========
+    # Check if GPU should be used
+    use_gpu_actual = False
+    if use_gpu == 'auto':
+        try:
+            from .gpu_utils import check_gpu_availability
+            has_cupy, has_cuda, _, _ = check_gpu_availability()
+            use_gpu_actual = has_cupy and has_cuda
+        except ImportError:
+            use_gpu_actual = False
+    elif use_gpu:
+        use_gpu_actual = True
+    
+    # Clear GPU cache before processing if using GPU
+    if use_gpu_actual:
+        try:
+            import cupy as cp
+            cp.get_default_memory_pool().free_all_blocks()
+            if verbose:
+                print("🚀 GPU acceleration enabled for CWT")
+        except ImportError:
+            use_gpu_actual = False
+            warnings.warn("GPU requested but CuPy not installed. Falling back to CPU.")
+    
+
+    # --- NEW: Batched GPU processing for CWT/STFT ---
+    if use_gpu_actual and method != 'multitaper':
+        from .gpu_utils import estimate_gpu_memory_per_event
+        import cupy as cp
+        lfp_segments = []
+        valid_events = []
+        for event in detector.swr_events:
+            t0 = event.get('basic_start_time', event.get('start_time'))
+            t1 = event.get('basic_end_time', event.get('end_time'))
+            peak_time = event.get('peak_time', 0.5 * (t0 + t1))
+            win_start = peak_time - pre_ms/1000.0
+            win_end = peak_time + post_ms/1000.0
+            idx0 = int(max(0, win_start * fs))
+            idx1 = int(min(len(lfp_array), win_end * fs))
+            lfp_seg = lfp_array[idx0:idx1]
+            if len(lfp_seg) < 8:
+                event['spectrogram'] = None
+                event['spectrogram_freqs'] = None
+                event['spectrogram_times'] = None
+                event['spectrogram_error'] = 'Segment too short for CWT/STFT'
+                continue
+            lfp_segments.append(lfp_seg)
+            valid_events.append(event)
+
+        if not lfp_segments:
+            return 0
+
+        # Pad all segments to the same length
+        max_len = max(len(seg) for seg in lfp_segments)
+        lfp_batch = np.stack([np.pad(seg, (0, max_len - len(seg)), mode='constant') for seg in lfp_segments], axis=0)
+
+        # Setup frequencies
+        min_freq, max_freq = freq_range
+        num_freqs = target_freq_bins if target_freq_bins else max(20, int((max_freq - min_freq) / 2.0))
+        freqs = np.linspace(min_freq, max_freq, num_freqs)
+        nyquist = fs / 2.0
+        freqs = freqs[freqs < nyquist]
+
+        # Estimate memory per event
+        mem_per_event_mb = estimate_gpu_memory_per_event(
+            n_freqs=len(freqs),
+            n_samples=lfp_batch.shape[1],
+            dtype='complex128'
+        )
+        free_mem, total_mem = cp.cuda.Device(0).mem_info
+        free_mem_mb = free_mem / (1024**2)
+        max_events_per_batch = max(1, int(free_mem_mb // (mem_per_event_mb * 1.5)))  # 1.5x safety margin
+
+        from .swr_spectral_features_gpu import _cwt_optimized_gpu_batched
+        for start in range(0, lfp_batch.shape[0], max_events_per_batch):
+            end = min(start + max_events_per_batch, lfp_batch.shape[0])
+            batch = lfp_batch[start:end]
+            Sxx_batch = _cwt_optimized_gpu_batched(
+                batch, fs, freqs,
+                boundary='mirror',
+                max_freqs_per_batch=gpu_batch_size,
+                verbose=verbose
+            )  # shape: (n_events, n_freqs, n_samples)
+            for i, event in enumerate(valid_events[start:end]):
+                Sxx = Sxx_batch[i]
+                # Resample time axis to n_bins
+                t_norm = np.linspace(0, 1, Sxx.shape[1])
+                t_target = np.linspace(0, 1, n_bins)
+                Sxx_resampled = np.zeros((Sxx.shape[0], n_bins))
+                for fi in range(Sxx.shape[0]):
+                    from scipy.interpolate import interp1d
+                    f_interp = interp1d(t_norm, Sxx[fi], kind='linear', bounds_error=False, fill_value=float(Sxx[fi][0]))
+                    Sxx_resampled[fi] = f_interp(t_target)
+                if smoothing_sigma is not None and smoothing_sigma > 0:
+                    import scipy.ndimage
+                    Sxx_resampled = scipy.ndimage.gaussian_filter(Sxx_resampled, sigma=[0, smoothing_sigma])
+                    # Compute and attach frequency_chirp for this event
+                    try:
+                        # Recompute event window to get duration
+                        t0 = event.get('basic_start_time', event.get('start_time'))
+                        t1 = event.get('basic_end_time', event.get('end_time'))
+                        peak_time = event.get('peak_time', 0.5 * (t0 + t1))
+                        win_start = peak_time - pre_ms/1000.0
+                        win_end = peak_time + post_ms/1000.0
+                        n_time = Sxx_resampled.shape[1]
+                        mid = n_time // 2
+                        if mid == 0:
+                            freq_first = freqs[np.argmax(Sxx_resampled.mean(axis=1))]
+                            freq_second = freq_first
+                        else:
+                            power_first = np.mean(Sxx_resampled[:, :mid], axis=1)
+                            power_second = np.mean(Sxx_resampled[:, mid:], axis=1)
+                            freq_first = freqs[int(np.argmax(power_first))] if power_first.size > 0 else np.nan
+                            freq_second = freqs[int(np.argmax(power_second))] if power_second.size > 0 else np.nan
+                        duration = max((win_end - win_start), 1e-6)
+                        event['frequency_chirp'] = float((freq_second - freq_first) / duration)
+                    except Exception:
+                        event['frequency_chirp'] = np.nan
+
+                    event['spectrogram'] = Sxx_resampled
+                    event['spectrogram_freqs'] = freqs
+                    event['spectrogram_times'] = t_target
+                    event['spectrogram_method'] = 'cwt'
+                n_with_spec += 1
+        # Final GPU cleanup
+        cp.get_default_memory_pool().free_all_blocks()
+        return n_with_spec
+
+    # --- Fallback: original per-event loop (CPU or multitaper) ---
+    for i, event in enumerate(detector.swr_events):
         try:
             if method == 'multitaper':
                 # Extract event window
@@ -423,7 +688,6 @@ def batch_compute_spectral_features(detector, lfp_array, fs, use='basic', n_bins
                 idx0 = int(max(0, win_start * fs))
                 idx1 = int(min(len(lfp_array), win_end * fs))
                 lfp_seg = lfp_array[idx0:idx1]
-                
                 # Check if segment is too short
                 if len(lfp_seg) < 8:
                     event['spectrogram'] = None
@@ -431,7 +695,6 @@ def batch_compute_spectral_features(detector, lfp_array, fs, use='basic', n_bins
                     event['spectrogram_times'] = None
                     event['spectrogram_error'] = 'Segment too short for multitaper'
                     continue
-                
                 # Compute single PSD for entire event (not time-resolved)
                 S, f, _, _ = mtspectrum(
                     lfp_seg, fs=fs, window_size=len(lfp_seg)/fs,
@@ -441,24 +704,22 @@ def batch_compute_spectral_features(detector, lfp_array, fs, use='basic', n_bins
                     ntapers=multitaper_kwargs.get('ntapers', 5),
                     pad=multitaper_kwargs.get('pad', 0)
                 )
-                
                 # Optional: Normalize PSD
                 if normalize_psd and np.sum(S) > 0:
                     S = S / np.sum(S)
-                
                 # Store as 1D PSD (NOT time-resolved spectrogram)
                 event['spectrogram'] = S  # Shape: (n_freqs,)
                 event['spectrogram_freqs'] = f
                 event['spectrogram_times'] = None  # No time axis for single PSD
                 event['spectrogram_method'] = 'multitaper'
-                
             else:
-                # Use compute_event_spectral_features (supports STFT/CWT)
+                # Use compute_event_spectral_features (supports STFT/CWT + GPU)
                 spec, freqs, t_norm = compute_event_spectral_features(
                     event, lfp_array, fs, n_bins=n_bins, freq_range=freq_range, pad_to=pad_to, 
                     smoothing_sigma=smoothing_sigma,
                     pre_ms=pre_ms, post_ms=post_ms, target_freq_bins=target_freq_bins,
-                    use_optimized_cwt=use_optimized_cwt, n_workers=n_workers, verbose=verbose
+                    use_optimized_cwt=use_optimized_cwt, n_workers=n_workers, verbose=False,
+                    use_gpu=use_gpu_actual, gpu_batch_size=gpu_batch_size
                 )
                 event['spectrogram'] = spec
                 event['spectrogram_freqs'] = freqs
@@ -610,6 +871,23 @@ def compute_event_spectral_features_from_trace(event, fs, n_bins=100):
         slope, _, _, _, _ = linregress(log_f, log_psd)
     else:
         slope = np.nan
+    # Compute frequency_chirp from the resampled spectrogram (first vs second half)
+    try:
+        n_time = Sxx_resampled.shape[1]
+        mid = n_time // 2
+        if mid == 0:
+            freq_first = f[np.argmax(Sxx_resampled.mean(axis=1))]
+            freq_second = freq_first
+        else:
+            power_first = np.mean(Sxx_resampled[:, :mid], axis=1)
+            power_second = np.mean(Sxx_resampled[:, mid:], axis=1)
+            freq_first = f[int(np.argmax(power_first))] if power_first.size > 0 else np.nan
+            freq_second = f[int(np.argmax(power_second))] if power_second.size > 0 else np.nan
+        duration = max(len(lfp_seg) / float(fs), 1e-6)
+        event['frequency_chirp'] = float((freq_second - freq_first) / duration)
+    except Exception:
+        event['frequency_chirp'] = np.nan
+
     event['spectrogram'] = Sxx_resampled
     event['spectrogram_freqs'] = f
     event['spectrogram_times'] = t_target

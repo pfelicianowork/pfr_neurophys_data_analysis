@@ -1,27 +1,261 @@
 """
 IMPROVED: Cluster events using combined autoencoder + biological features.
 Includes optimal k selection and cross-validation.
+Pure PyTorch implementation (no fastai dependencies).
 """
 
 import torch
 from torch import nn
-from fastai.vision.all import *
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
 import os
 import pickle
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.mixture import GaussianMixture
+from sklearn.metrics import (
+    silhouette_score, 
+    davies_bouldin_score,
+    calinski_harabasz_score,
+    adjusted_rand_score
+)
+from sklearn.model_selection import KFold
+from scipy.cluster.hierarchy import dendrogram, linkage
+import matplotlib.pyplot as plt
 import argparse
+from pathlib import Path
 
 # Import improved modules
-from improved_autoencoder import ResNetAutoencoder, SWR_VAE
-from advanced_clustering import (
-    find_optimal_clusters,
-    cross_validate_clustering,
-    plot_clustering_metrics,
-    plot_dendrogram,
-    analyze_cluster_separation
-)
+from cnn_autoencoder.improved_autoencoder import ResNetAutoencoder, SWR_VAE
+
+
+# ===============================================================
+# Dataset class for loading spectrograms (replaces fastai)
+# ===============================================================
+
+class SpectrogramDataset(Dataset):
+    """Dataset for loading spectrogram images."""
+    
+    def __init__(self, image_paths, transform=None):
+        self.image_paths = sorted(image_paths)
+        self.transform = transform
+        
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert('L')  # Grayscale
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return image
+
+
+# ===============================================================
+# Clustering utility functions (replaces advanced_clustering)
+# ===============================================================
+
+def find_optimal_clusters(features, k_range, methods=['kmeans', 'hierarchical', 'gmm']):
+    """
+    Find optimal number of clusters using multiple methods and metrics.
+    
+    Returns:
+    --------
+    best_config : dict
+        Best clustering configuration with labels and metrics
+    results_df : pd.DataFrame
+        All clustering results for comparison
+    """
+    results = []
+    best_score = -1
+    best_config = None
+    
+    for k in k_range:
+        for method in methods:
+            try:
+                # Perform clustering
+                if method == 'kmeans':
+                    clusterer = KMeans(n_clusters=k, random_state=42, n_init=10)
+                    labels = clusterer.fit_predict(features)
+                elif method == 'hierarchical':
+                    clusterer = AgglomerativeClustering(n_clusters=k)
+                    labels = clusterer.fit_predict(features)
+                elif method == 'gmm':
+                    clusterer = GaussianMixture(n_components=k, random_state=42)
+                    labels = clusterer.fit_predict(features)
+                else:
+                    continue
+                
+                # Calculate metrics
+                sil = silhouette_score(features, labels)
+                db = davies_bouldin_score(features, labels)
+                ch = calinski_harabasz_score(features, labels)
+                
+                results.append({
+                    'k': k,
+                    'method': method,
+                    'silhouette': sil,
+                    'davies_bouldin': db,
+                    'calinski_harabasz': ch
+                })
+                
+                # Track best (using silhouette score)
+                if sil > best_score:
+                    best_score = sil
+                    best_config = {
+                        'k': k,
+                        'method': method,
+                        'labels': labels,
+                        'silhouette': sil,
+                        'davies_bouldin': db,
+                        'calinski_harabasz': ch
+                    }
+                
+                print(f"  k={k}, {method}: silhouette={sil:.3f}, DB={db:.3f}, CH={ch:.1f}")
+            
+            except Exception as e:
+                print(f"  k={k}, {method}: Failed - {e}")
+    
+    results_df = pd.DataFrame(results)
+    return best_config, results_df
+
+
+def cross_validate_clustering(features, n_clusters, n_splits=5, method='kmeans'):
+    """
+    Cross-validate clustering stability using ARI scores.
+    
+    Returns:
+    --------
+    ari_scores : list
+        ARI scores for each fold comparison
+    """
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    ari_scores = []
+    
+    # Get reference clustering on full data
+    if method == 'kmeans':
+        ref_clusterer = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    elif method == 'hierarchical':
+        ref_clusterer = AgglomerativeClustering(n_clusters=n_clusters)
+    elif method == 'gmm':
+        ref_clusterer = GaussianMixture(n_components=n_clusters, random_state=42)
+    
+    ref_labels = ref_clusterer.fit_predict(features)
+    
+    # Compare with fold clusterings
+    for fold_idx, (train_idx, test_idx) in enumerate(kf.split(features)):
+        # Cluster on full data again (for reproducibility)
+        if method == 'kmeans':
+            fold_clusterer = KMeans(n_clusters=n_clusters, random_state=fold_idx, n_init=10)
+        elif method == 'hierarchical':
+            fold_clusterer = AgglomerativeClustering(n_clusters=n_clusters)
+        elif method == 'gmm':
+            fold_clusterer = GaussianMixture(n_components=n_clusters, random_state=fold_idx)
+        
+        fold_labels = fold_clusterer.fit_predict(features)
+        
+        # Calculate ARI
+        ari = adjusted_rand_score(ref_labels, fold_labels)
+        ari_scores.append(ari)
+    
+    print(f"Cross-validation ARI: {np.mean(ari_scores):.3f} ± {np.std(ari_scores):.3f}")
+    return ari_scores
+
+
+def plot_clustering_metrics(results_df):
+    """Plot clustering metrics comparison."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    
+    for method in results_df['method'].unique():
+        method_data = results_df[results_df['method'] == method]
+        
+        axes[0].plot(method_data['k'], method_data['silhouette'], 'o-', label=method)
+        axes[1].plot(method_data['k'], method_data['davies_bouldin'], 'o-', label=method)
+        axes[2].plot(method_data['k'], method_data['calinski_harabasz'], 'o-', label=method)
+    
+    axes[0].set_xlabel('Number of clusters (k)')
+    axes[0].set_ylabel('Silhouette Score')
+    axes[0].set_title('Silhouette Score (higher is better)')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    axes[1].set_xlabel('Number of clusters (k)')
+    axes[1].set_ylabel('Davies-Bouldin Index')
+    axes[1].set_title('Davies-Bouldin Index (lower is better)')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    axes[2].set_xlabel('Number of clusters (k)')
+    axes[2].set_ylabel('Calinski-Harabasz Index')
+    axes[2].set_title('Calinski-Harabasz Index (higher is better)')
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('clustering_metrics_comparison.png', dpi=150, bbox_inches='tight')
+    print(f"✓ Saved clustering metrics plot to 'clustering_metrics_comparison.png'")
+    plt.close()
+
+
+def plot_dendrogram(features, max_samples=500):
+    """Plot hierarchical clustering dendrogram."""
+    # Subsample if needed
+    if len(features) > max_samples:
+        idx = np.random.choice(len(features), max_samples, replace=False)
+        features_subset = features[idx]
+    else:
+        features_subset = features
+    
+    # Compute linkage
+    linkage_matrix = linkage(features_subset, method='ward')
+    
+    # Plot
+    plt.figure(figsize=(12, 6))
+    dendrogram(linkage_matrix, no_labels=True)
+    plt.xlabel('Sample index')
+    plt.ylabel('Distance')
+    plt.title(f'Hierarchical Clustering Dendrogram (n={len(features_subset)})')
+    plt.savefig('clustering_dendrogram.png', dpi=150, bbox_inches='tight')
+    print(f"✓ Saved dendrogram to 'clustering_dendrogram.png'")
+    plt.close()
+
+
+def analyze_cluster_separation(features, labels):
+    """Analyze cluster separation (inter vs intra distances)."""
+    unique_labels = np.unique(labels)
+    
+    # Calculate within-cluster distances
+    intra_dists = []
+    for label in unique_labels:
+        cluster_points = features[labels == label]
+        if len(cluster_points) > 1:
+            centroid = cluster_points.mean(axis=0)
+            dists = np.linalg.norm(cluster_points - centroid, axis=1)
+            intra_dists.extend(dists)
+    
+    # Calculate between-cluster distances
+    centroids = []
+    for label in unique_labels:
+        cluster_points = features[labels == label]
+        centroids.append(cluster_points.mean(axis=0))
+    centroids = np.array(centroids)
+    
+    inter_dists = []
+    for i in range(len(centroids)):
+        for j in range(i+1, len(centroids)):
+            dist = np.linalg.norm(centroids[i] - centroids[j])
+            inter_dists.append(dist)
+    
+    print(f"Inter-cluster distance: {np.mean(inter_dists):.3f} ± {np.std(inter_dists):.3f}")
+    print(f"Intra-cluster distance: {np.mean(intra_dists):.3f} ± {np.std(intra_dists):.3f}")
+    print(f"Separation ratio: {np.mean(inter_dists) / np.mean(intra_dists):.3f}")
+    
+    return inter_dists, intra_dists
 
 
 def load_encoder(arch='resnet', latent_dim=128):
@@ -30,7 +264,7 @@ def load_encoder(arch='resnet', latent_dim=128):
     
     if not os.path.exists(encoder_path):
         print(f"Error: Encoder model not found at '{encoder_path}'")
-        print(f"Train the model first using: python train_autoencoder_improved.py --arch {arch}")
+        print(f"Train the model first using: python train_autoencoder.py --arch {arch}")
         return None
     
     print(f"Loading {arch.upper()} encoder from '{encoder_path}'...")
@@ -44,7 +278,7 @@ def load_encoder(arch='resnet', latent_dim=128):
         model.encoder_conv.load_state_dict(torch.load(encoder_path, weights_only=False))
         encoder = model.encoder_conv
     elif arch == 'attention':
-        from improved_autoencoder import AttentionAutoencoder
+        from cnn_autoencoder.improved_autoencoder import AttentionAutoencoder
         model = AttentionAutoencoder(latent_dim=latent_dim)
         encoder = model.encoder
         encoder.load_state_dict(torch.load(encoder_path, weights_only=False))
@@ -54,27 +288,32 @@ def load_encoder(arch='resnet', latent_dim=128):
 
 
 def extract_autoencoder_features(encoder, images_path, batch_size=64):
-    """Extract features using trained encoder."""
+    """Extract features using trained encoder (pure PyTorch)."""
     
     print("Extracting autoencoder features...")
     
-    # Create DataBlock for inference
-    dblock = DataBlock(
-        blocks=(ImageBlock(cls=PILImageBW)),
-        get_items=lambda p: p,
-        item_tfms=Resize(128)
-    )
+    # Get image files
+    image_files = sorted(list(Path(images_path).glob("*.png")))
+    print(f"Found {len(image_files)} images")
     
-    img_files = get_image_files(images_path).sorted()
-    dls = dblock.dataloaders(img_files, bs=batch_size, num_workers=0)
-    test_dl = dls.test_dl(img_files)
+    # Create dataset and dataloader
+    transform = transforms.Compose([
+        transforms.Resize((128, 128)),
+        transforms.ToTensor(),
+    ])
+    
+    dataset = SpectrogramDataset(image_files, transform=transform)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     
     # Extract features
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    encoder = encoder.to(device)
+    
     features_list = []
     
     with torch.no_grad():
-        for batch in test_dl:
-            imgs = batch[0]
+        for imgs in dataloader:
+            imgs = imgs.to(device)
             feats = encoder(imgs)
             features_list.append(feats.cpu().numpy())
     

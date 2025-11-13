@@ -2216,7 +2216,6 @@ class SWRHMMDetector:
                 'ripple_low_threshold': float(ripple_low_th) if ripple_low_th is not None else None,
                 'mua_threshold': float(mua_threshold) if mua_threshold is not None else None,
                 'ripple_peak_freq': ripple_peak_freq,
-                'ripple_peak_freq': ripple_peak_freq,
                 'ripple_peak_freq_power': ripple_peak_freq_power,
                 'ripple_peak_amplitude': float(ripple_peak) if 'ripple_peak' in locals() and ripple_peak is not None else None,
                 'mua_peak_amplitude': float(mua_peak) if 'mua_peak' in locals() and mua_peak is not None else None,
@@ -2228,6 +2227,11 @@ class SWRHMMDetector:
                 'mua_trace': smooth_mua[trace_start:trace_end] if smooth_mua is not None else None,
                 'ripple_power': smooth_ripple_power[trace_start:trace_end],
                 'sharpwave_trace': sharpwave_filtered[trace_start:trace_end] if sharpwave_filtered is not None else None,
+                # Store sharp-wave envelope and summary statistics so downstream feature
+                # extraction and clustering can use slow-wave information (0.5-20 Hz)
+                'sharpwave_envelope': (sharpwave_power[trace_start:trace_end] if 'sharpwave_power' in locals() and sharpwave_power is not None else None),
+                'sharpwave_mean_power': (float(np.mean(smooth_sw_power[trace_start:trace_end])) if 'smooth_sw_power' in locals() and smooth_sw_power is not None else None),
+                'sharpwave_peak_amp': (float(np.max(sharpwave_filtered[trace_start:trace_end])) if sharpwave_filtered is not None and (trace_end>trace_start) else None),
                 'trace_timestamps': np.linspace(
                     peak_time - (peak_idx - trace_start) / self.fs if peak_time is not None and peak_idx is not None else 0,
                     peak_time + (trace_end - peak_idx) / self.fs if peak_time is not None and peak_idx is not None else (trace_end - trace_start) / self.fs,

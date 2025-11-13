@@ -13,7 +13,7 @@ from PIL import Image
 import argparse
 
 # Import validation modules
-from biological_validation import (
+from cnn_autoencoder.biological_validation import (
     validate_clusters_biologically,
     compare_clusters_statistically,
     plot_cluster_characteristics,
@@ -229,10 +229,23 @@ def evaluate_clusters_improved(feature_type='combined'):
                 ax.imshow(img, cmap='viridis', aspect='auto')
                 
                 # Add event info
-                duration_ms = event_row.get('duration', 0) * 1000
-                power = event_row.get('ripple_power', 0)
+                duration_val = event_row.get('duration', 0)
+                power_val = event_row.get('ripple_power', 0)
+                
+                # Ensure scalar values for display
+                if isinstance(duration_val, (np.ndarray, list)):
+                    duration_val = float(np.mean(duration_val)) if len(duration_val) > 0 else 0.0
+                else:
+                    duration_val = float(duration_val)
+                    
+                if isinstance(power_val, (np.ndarray, list)):
+                    power_val = float(np.mean(power_val)) if len(power_val) > 0 else 0.0
+                else:
+                    power_val = float(power_val)
+                
+                duration_ms = duration_val * 1000
                 ax.set_title(f"Event {event_row['original_index']}\n"
-                           f"Dur: {duration_ms:.0f}ms, Pwr: {power:.2f}",
+                           f"Dur: {duration_ms:.0f}ms, Pwr: {power_val:.2f}",
                            fontsize=9)
             else:
                 ax.set_title(f"Image not found")

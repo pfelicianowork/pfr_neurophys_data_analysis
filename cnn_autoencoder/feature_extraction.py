@@ -37,7 +37,7 @@ def ms_to_samples(ms, fs):
     return int(np.round(ms / 1000.0 * fs))
 
 
-def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp=None, pre_ms=100, post_ms=100):
+def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp=None, extension_ms=0):
     """
     Extract comprehensive SWR features beyond spectrograms.
     
@@ -73,53 +73,142 @@ def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp=None, pre_ms=
     else:
         features['peak_time_normalized'] = 0.5  # Default to middle
     
-    # --- 2. Ripple Band Features (125-250 Hz) ---
-    ripple_power = event.get('ripple_power', 0)
-    # Ensure ripple_power is scalar (take mean if array)
-    if isinstance(ripple_power, np.ndarray):
-        ripple_power = np.mean(ripple_power)
-    features['ripple_power'] = float(ripple_power)
-    features['ripple_power_log'] = np.log1p(ripple_power)
-    
-    # Extract peak frequency from spectrogram if available
-    if 'spectrogram' in event and event['spectrogram'] is not None:
-        spec = event['spectrogram']
-        freqs = event.get('spectrogram_freqs')
-        
-        if freqs is not None and isinstance(spec, np.ndarray) and spec.size > 0:
-            # Handle both 2D (STFT/CWT) and 1D (multitaper) spectrograms
-            if spec.ndim == 2:
-                # 2D spectrogram: average power across time to get frequency profile
-                freq_profile = np.mean(spec, axis=1)
-            elif spec.ndim == 1:
-                # 1D PSD (multitaper): use directly
-                freq_profile = spec
-            else:
-                freq_profile = None
-            
-            if freq_profile is not None and len(freq_profile) == len(freqs):
-                # Find frequency with maximum power
-                peak_freq_idx = np.argmax(freq_profile)
-                features['ripple_peak_freq'] = float(freqs[peak_freq_idx])
-            else:
-                # Fallback to stored value or default
-                features['ripple_peak_freq'] = float(event.get('peak_frequency', 150))
+
+    # Calculate extension in samples and event indices
+    extension_samples = ms_to_samples(extension_ms, fs)
+    start_idx = int(features['start_time'] * fs) - extension_samples
+    end_idx = int(features['end_time'] * fs) + extension_samples
+    start_idx = max(0, start_idx)
+    # For LFP, use length check if available
+    lfp_len = len(lfp_array) if lfp_array is not None and getattr(lfp_array, 'ndim', 1) == 1 else (lfp_array.shape[1] if lfp_array is not None else 0)
+    end_idx = min(lfp_len, end_idx) if lfp_len else end_idx
+
+    # Extract the LFP segment for this event (with extension)
+    if lfp_array is not None:
+        if getattr(lfp_array, 'ndim', 1) == 1:
+            lfp_seg = lfp_array[start_idx:end_idx]
         else:
-            # No valid frequency data
-            features['ripple_peak_freq'] = float(event.get('peak_frequency', 150))
+            lfp_seg = lfp_array[0, start_idx:end_idx]
     else:
-        # No spectrogram available
+        lfp_seg = np.array([])
+
+    # Filter into ripple band (125-250 Hz)
+    if len(lfp_seg) > 4:
+        try:
+            b, a = butter(3, [125, 250], btype='band', fs=fs)
+            ripple_filt = filtfilt(b, a, lfp_seg)
+            analytic = hilbert(ripple_filt)
+            envelope = np.abs(analytic)
+            envelope_power = envelope ** 2
+            # Normalize envelope power (z-score)
+            env_mean = np.mean(envelope_power)
+            env_std = np.std(envelope_power) + 1e-10
+            envelope_power_norm = (envelope_power - env_mean) / env_std
+
+            # Ripple power: mean of normalized envelope power
+            features['ripple_power'] = float(np.mean(envelope_power_norm))
+
+            # Ripple amplitude: max of envelope
+            features['ripple_amplitude'] = float(np.max(envelope))
+
+            # Envelope asymmetry
+            peak_idx = np.argmax(envelope)
+            rise_time = peak_idx / fs
+            decay_time = (len(envelope) - peak_idx - 1) / fs
+            if (decay_time + rise_time) > 0:
+                features['envelope_asymmetry'] = float((decay_time - rise_time) / (decay_time + rise_time))
+            else:
+                features['envelope_asymmetry'] = 0.0
+
+            # Envelope kurtosis
+            features['envelope_kurtosis'] = float(kurtosis(envelope_power_norm))
+
+            # Envelope area
+            features['envelope_area'] = float(np.trapz(envelope_power_norm))
+
+            # Envelope curvature (second derivative)
+            if len(envelope_power_norm) > 2:
+                curvature = np.diff(envelope_power_norm, n=2)
+                features['envelope_curvature'] = float(np.mean(np.abs(curvature)))
+            else:
+                features['envelope_curvature'] = 0.0
+
+            # Peak frequency from spectrogram if available (legacy)
+            if 'spectrogram' in event and event['spectrogram'] is not None:
+                spec = event['spectrogram']
+                freqs = event.get('spectrogram_freqs')
+                if freqs is not None and isinstance(spec, np.ndarray) and spec.size > 0:
+                    if spec.ndim == 2:
+                        freq_profile = np.mean(spec, axis=1)
+                    elif spec.ndim == 1:
+                        freq_profile = spec
+                    else:
+                        freq_profile = None
+                    if freq_profile is not None and len(freq_profile) == len(freqs):
+                        peak_freq_idx = np.argmax(freq_profile)
+                        features['ripple_peak_freq'] = float(freqs[peak_freq_idx])
+                    else:
+                        features['ripple_peak_freq'] = float(event.get('peak_frequency', 150))
+                else:
+                    features['ripple_peak_freq'] = float(event.get('peak_frequency', 150))
+            else:
+                features['ripple_peak_freq'] = float(event.get('peak_frequency', 150))
+
+            # In ripple band
+            peak_freq = features['ripple_peak_freq']
+            features['in_ripple_band'] = 1.0 if (125 <= peak_freq <= 250) else 0.0
+
+            # --- 9. Slow Oscillation (0.5-4 Hz) Phase Features ---
+            # Compute phase at event peak and at ripple peak
+            try:
+                b_slow, a_slow = butter(3, [0.5, 4], btype='band', fs=fs)
+                slow_filt = filtfilt(b_slow, a_slow, lfp_seg)
+                analytic_slow = hilbert(slow_filt)
+                slow_phase = np.angle(analytic_slow)
+                # Phase at event peak (center of segment)
+                event_peak_idx = len(slow_phase) // 2
+                features['slow_wave_phase_at_event_peak'] = float(slow_phase[event_peak_idx]) if len(slow_phase) > 0 else 0.0
+                # Phase at ripple peak (use envelope from ripple band)
+                if len(envelope) == len(slow_phase):
+                    ripple_peak_idx = int(np.argmax(envelope))
+                    if 0 <= ripple_peak_idx < len(slow_phase):
+                        features['slow_wave_phase_at_ripple_peak'] = float(slow_phase[ripple_peak_idx])
+                    else:
+                        features['slow_wave_phase_at_ripple_peak'] = 0.0
+                else:
+                    features['slow_wave_phase_at_ripple_peak'] = 0.0
+            except Exception:
+                features['slow_wave_phase_at_event_peak'] = 0.0
+                features['slow_wave_phase_at_ripple_peak'] = 0.0
+
+        except Exception:
+            features['ripple_power'] = 0.0
+            features['ripple_amplitude'] = 0.0
+            features['envelope_asymmetry'] = 0.0
+            features['envelope_kurtosis'] = 0.0
+            features['envelope_area'] = 0.0
+            features['envelope_curvature'] = 0.0
+            features['ripple_peak_freq'] = float(event.get('peak_frequency', 150))
+            features['in_ripple_band'] = 0.0
+            features['slow_wave_phase_at_event_peak'] = 0.0
+            features['slow_wave_phase_at_ripple_peak'] = 0.0
+    else:
+        features['ripple_power'] = 0.0
+        features['ripple_amplitude'] = 0.0
+        features['envelope_asymmetry'] = 0.0
+        features['envelope_kurtosis'] = 0.0
+        features['envelope_area'] = 0.0
+        features['envelope_curvature'] = 0.0
         features['ripple_peak_freq'] = float(event.get('peak_frequency', 150))
-    
-    features['ripple_amplitude'] = event.get('ripple_amplitude', 0)
-    
-    # Ripple frequency band percentage
-    peak_freq = features['ripple_peak_freq']
-    features['in_ripple_band'] = 1.0 if (125 <= peak_freq <= 250) else 0.0
+        features['in_ripple_band'] = 0.0
+        features['slow_wave_phase_at_event_peak'] = 0.0
+        features['slow_wave_phase_at_ripple_peak'] = 0.0
     
     # --- 3. MUA Features ---
-    start_idx = int(features['start_time'] * fs)
-    end_idx = int(features['end_time'] * fs)
+    # Calculate extension in samples
+    extension_samples = ms_to_samples(extension_ms, fs)
+    start_idx = int(features['start_time'] * fs) - extension_samples
+    end_idx = int(features['end_time'] * fs) + extension_samples
 
     # Ensure indices are within bounds
     start_idx = max(0, start_idx)
@@ -139,36 +228,6 @@ def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp=None, pre_ms=
         features['mua_std'] = 0.0
         features['mua_integral'] = 0.0
         features['mua_peak_time'] = 0.5
-
-    # Context windows (pre/post) in samples
-    pre_samples = ms_to_samples(pre_ms, fs)
-    post_samples = ms_to_samples(post_ms, fs)
-
-    pre_start = max(0, start_idx - pre_samples)
-    pre_end = start_idx
-    post_start = end_idx
-    post_end = min(len(mua_vec), end_idx + post_samples)
-
-    # --- New: contextual MUA features (pre / post) ---
-    if pre_end > pre_start:
-        mua_pre = mua_vec[pre_start:pre_end]
-        features['pre_mua_mean'] = float(np.mean(mua_pre))
-        features['pre_mua_max'] = float(np.max(mua_pre))
-        features['pre_mua_integral'] = float(np.trapz(mua_pre))
-    else:
-        features['pre_mua_mean'] = 0.0
-        features['pre_mua_max'] = 0.0
-        features['pre_mua_integral'] = 0.0
-
-    if post_end > post_start:
-        mua_post = mua_vec[post_start:post_end]
-        features['post_mua_mean'] = float(np.mean(mua_post))
-        features['post_mua_max'] = float(np.max(mua_post))
-        features['post_mua_integral'] = float(np.trapz(mua_post))
-    else:
-        features['post_mua_mean'] = 0.0
-        features['post_mua_max'] = 0.0
-        features['post_mua_integral'] = 0.0
     
     # --- NEW: Sharp-wave (0.5-20 Hz) features ---
     try:
@@ -194,8 +253,27 @@ def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp=None, pre_ms=
             features['sharpwave_peak_amp'] = float(np.max(sw_seg))
             features['sharpwave_peak_amp_abs'] = float(np.max(np.abs(sw_seg)))
             features['sharpwave_env_mean'] = float(np.mean(sw_env))
-            features['sharpwave_mean_power'] = float(np.mean(sw_env**2))
             features['sharpwave_area'] = float(np.trapz(np.abs(sw_seg)))
+
+            # Sharp-wave symmetry: (decay_time - rise_time) / (decay_time + rise_time)
+            peak_idx = int(np.argmax(np.abs(sw_seg)))
+            rise_time = peak_idx / fs
+            decay_time = (len(sw_seg) - peak_idx - 1) / fs
+            if (decay_time + rise_time) > 0:
+                features['sharpwave_symmetry'] = float((decay_time - rise_time) / (decay_time + rise_time))
+            else:
+                features['sharpwave_symmetry'] = 0.0
+
+            # Sharp-wave curvature (second derivative)
+            if len(sw_seg) > 2:
+                curvature = np.diff(sw_seg, n=2)
+                features['sharpwave_curvature'] = float(np.mean(np.abs(curvature)))
+            else:
+                features['sharpwave_curvature'] = 0.0
+
+            # Sharp-wave kurtosis
+            from scipy.stats import kurtosis as _kurtosis
+            features['sharpwave_kurtosis'] = float(_kurtosis(sw_seg)) if len(sw_seg) > 3 else 0.0
 
             # slope (linear fit)
             try:
@@ -210,11 +288,9 @@ def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp=None, pre_ms=
             features['sharpwave_polarity'] = float(np.sign(np.mean(sw_seg)))
 
             # peak latency relative to event (fraction)
-            peak_idx = int(np.argmax(np.abs(sw_seg)))
             features['sharpwave_peak_latency'] = float(peak_idx) / max(1, len(sw_seg))
 
             # attach envelope into the event dict for downstream use (PAC, plotting)
-            # store envelope on the event for later use
             try:
                 event['sharpwave_envelope'] = sw_env.tolist()
             except Exception:
@@ -309,21 +385,6 @@ def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp=None, pre_ms=
                 features['ripple_mua_correlation'] = 0.0
         else:
             features['ripple_mua_correlation'] = 0.0
-
-        # contextual envelope (pre / post)
-        env_pre = env[pre_start:pre_end] if (pre_end > pre_start and len(env) >= pre_end) else (env[pre_start:pre_end] if pre_end>pre_start else np.array([]))
-        env_post = env[post_start:post_end] if (post_end > post_start and len(env) >= post_end) else (env[post_start:post_end] if post_end>post_start else np.array([]))
-
-        features['pre_ripple_env_mean'] = float(np.mean(env_pre)) if getattr(env_pre, 'size', 0) else 0.0
-        features['post_ripple_env_mean'] = float(np.mean(env_post)) if getattr(env_post, 'size', 0) else 0.0
-        features['power_ratio_event_to_pre'] = float(np.mean(env_seg) / (np.mean(env_pre) + 1e-10)) if getattr(env_pre, 'size', 0) else 0.0
-        features['power_ratio_event_to_post'] = float(np.mean(env_seg) / (np.mean(env_post) + 1e-10)) if getattr(env_post, 'size', 0) else 0.0
-    else:
-        features['ripple_mua_correlation'] = 0.0
-        features['pre_ripple_env_mean'] = 0.0
-        features['post_ripple_env_mean'] = 0.0
-        features['power_ratio_event_to_pre'] = 0.0
-        features['power_ratio_event_to_post'] = 0.0
     
     # --- 5. Spectral Features from Spectrogram ---
     if 'spectrogram' in event and event['spectrogram'] is not None:
@@ -356,12 +417,15 @@ def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp=None, pre_ms=
                 features['spec_spread'] = np.sqrt(np.sum(((np.arange(len(freq_profile)) - centroid)**2) * freq_profile) / np.sum(freq_profile))
             else:
                 features['spec_spread'] = 0.0
+            # Frequency chirp computed from spectrogram (Hz per second)
+            features['frequency_chirp'] = float(event.get('frequency_chirp', np.nan))
         else:
             features['spec_entropy'] = 0.0
             features['spec_peak_power'] = 0.0
             features['spec_mean_power'] = 0.0
             features['spec_centroid'] = 0.0
             features['spec_spread'] = 0.0
+            features['frequency_chirp'] = 0.0
     else:
         features['spec_entropy'] = 0.0
         features['spec_peak_power'] = 0.0
@@ -433,7 +497,7 @@ def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp=None, pre_ms=
     
     # --- 8. Multi-Channel Spatial Features ---
     if region_lfp is not None:
-        spatial_features = extract_multichannel_features(event, region_lfp, fs)
+        spatial_features = extract_multichannel_features(event, region_lfp, fs, extension_ms=extension_ms)
         features.update(spatial_features)
     
     # --- 9. Signal Quality Metrics ---
@@ -448,7 +512,7 @@ def extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp=None, pre_ms=
     return features
 
 
-def extract_multichannel_features(event, region_lfp, fs):
+def extract_multichannel_features(event, region_lfp, fs, extension_ms=0):
     """
     Extract features across multiple recording channels.
     
@@ -469,8 +533,9 @@ def extract_multichannel_features(event, region_lfp, fs):
     
     features = {}
     
-    start_idx = int(event['start_time'] * fs)
-    end_idx = int(event['end_time'] * fs)
+    extension_samples = ms_to_samples(extension_ms, fs)
+    start_idx = int(event['start_time'] * fs) - extension_samples
+    end_idx = int(event['end_time'] * fs) + extension_samples
     
     # Use CA1 channels (or whichever region is primary)
     if 'CA1' in region_lfp:
@@ -541,7 +606,7 @@ def extract_multichannel_features(event, region_lfp, fs):
     return features
 
 
-def batch_extract_features(events, lfp_array, mua_vec, fs, region_lfp=None, verbose=True, normalize_lfp=True, pre_ms=100, post_ms=100):
+def batch_extract_features(events, lfp_array, mua_vec, fs, region_lfp=None, verbose=True, normalize_lfp=True, extension_ms=0):
     """
     Extract features for all events in batch.
     
@@ -584,7 +649,7 @@ def batch_extract_features(events, lfp_array, mua_vec, fs, region_lfp=None, verb
         if verbose and i % 100 == 0:
             print(f"Extracting features: {i}/{len(events)}...")
 
-        features = extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp, pre_ms=pre_ms, post_ms=post_ms)
+        features = extract_swr_features(event, lfp_array, mua_vec, fs, region_lfp, extension_ms=extension_ms)
 
         if feature_names is None:
             feature_names = sorted(features.keys())
