@@ -55,7 +55,7 @@ def _autodetect_label_keys(events):
     return [k for k in keys if 'cluster' in k.lower() or 'label' in k.lower()]
 
 
-def visualize_features(feature_matrix, feature_names=None, events: Optional[list] = None, figsize=(8, 4)):
+def visualize_features(feature_matrix, feature_names=None, events: Optional[list] = None, figsize=(8, 4), auto_display=True):
     """Launch an interactive widget for exploring extracted features.
 
     Parameters
@@ -71,8 +71,10 @@ def visualize_features(feature_matrix, feature_names=None, events: Optional[list
 
     Returns
     -------
-    out : ipywidgets.Output
-        Output widget containing the plots (also displayed inline).
+    widget or None
+        If `auto_display` is True, the widget is displayed and None is returned. If
+        `auto_display` is False then the widget (HBox/VBox container) is returned so
+        the caller can display it manually.
     """
     if widgets is None:
         raise RuntimeError("ipywidgets not available. Install ipywidgets to use interactive visualization.")
@@ -273,7 +275,14 @@ def visualize_features(feature_matrix, feature_names=None, events: Optional[list
     controls_top = widgets.HBox([view_w, x_w, y_w, single_w])
     controls_mid = widgets.HBox([bins_w, kde_w, clip_w, logx_w, logy_w])
     controls_bot = widgets.HBox([label_key_w, label_val_w, export_btn])
-    display(widgets.VBox([controls_top, controls_mid, controls_bot, out]))
+    container = widgets.VBox([controls_top, controls_mid, controls_bot, out])
     # initial plot
     _plot()
-    return out
+    if auto_display:
+        display(container)
+        # We return None when auto_display is True to avoid duplicate display in
+        # Jupyter notebooks (display() + returning a displayable causes a second
+        # render when the return value is auto-displayed by the notebook).
+        return None
+    # If not auto_display, return the container so the caller can display it when desired
+    return container
